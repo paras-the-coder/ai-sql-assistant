@@ -240,15 +240,3 @@ text_to_sql/
 ```
 
 ---
-
-## 💡 Key Engineering Decisions
-
-1. **Why Groq?** Groq provides blazing-fast LPU inference (typically 300–500 tokens/sec), ensuring that SQL generation feels instantaneous for interactive dashboards.
-2. **Why SQLite Read-Only Mode (`?mode=ro`)?** Application-layer prompt validation alone is insufficient for AI products. Physical DB enforcement guarantees zero risk of data mutation.
-3. **Few-Shot Prompt Engineering:** Supplying schema-specific examples in [`prompts.py`](file:///d:/Projectss/text_to_sql/prompts.py) eliminated common SQL dialect errors (e.g., date arithmetic differences between Postgres and SQLite).
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License — feel free to use and adapt it for your own applications.
