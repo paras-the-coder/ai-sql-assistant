@@ -46,6 +46,7 @@ ORDER BY headcount DESC;
 SELECT e.name, e.role, e.salary, d.name AS department
 FROM employees e
 JOIN departments d ON e.dept_id = d.dept_id
+WHERE e.is_active = 1
 ORDER BY e.salary DESC
 LIMIT 3;
         """.strip(),

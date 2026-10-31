@@ -1,0 +1,69 @@
+"""
+tests/test_utils.py  —  Unit & security tests for Text-to-SQL validators and database execution.
+Run:  pytest
+"""
+
+import sqlite3
+import pytest
+from utils import validate_sql, extract_sql, execute_query
+
+
+def test_validate_sql_valid_queries():
+    """Verify standard read-only SELECT and WITH queries pass."""
+    ok, _ = validate_sql("SELECT name, salary FROM employees WHERE is_active = 1;")
+    assert ok is True
+
+    ok, _ = validate_sql("WITH dept_summary AS (SELECT dept_id FROM departments) SELECT * FROM dept_summary;")
+    assert ok is True
+
+
+def test_validate_sql_blocks_destructive_commands():
+    """Verify write, drop, and schema modification commands are blocked."""
+    destructive = [
+        "DROP TABLE employees;",
+        "DELETE FROM departments;",
+        "UPDATE employees SET salary = 999999;",
+        "INSERT INTO departments VALUES (10, 'Hacked', 'Nowhere', 0, 'Evil');",
+        "ALTER TABLE employees ADD COLUMN ssn TEXT;",
+        "CREATE TABLE backdoor (id INT);",
+        "TRUNCATE TABLE sales;",
+    ]
+    for sql in destructive:
+        ok, reason = validate_sql(sql)
+        assert ok is False
+        assert "Blocked" in reason
+
+
+def test_validate_sql_blocks_obfuscated_bypasses():
+    """Verify whitespace variants (tabs, newlines, semicolons) cannot bypass the guardrail."""
+    bypasses = [
+        "SELECT 1; DROP\tTABLE employees;",
+        "SELECT 1;\nDELETE\nFROM employees;",
+        "SELECT 1; ATTACH DATABASE 'evil.db' AS evil;",
+        "SELECT 1; DETACH DATABASE evil;",
+    ]
+    for sql in bypasses:
+        ok, reason = validate_sql(sql)
+        assert ok is False
+        assert "Blocked" in reason
+
+
+def test_extract_sql_strips_markdown_and_prose():
+    """Verify markdown fences and trailing comments/assumptions are stripped."""
+    raw_markdown = "```sql\nSELECT name FROM employees;\n```"
+    assert extract_sql(raw_markdown) == "SELECT name FROM employees;"
+
+    raw_with_prose = "```sql\nSELECT count(*) FROM departments;\n```\nNote: I assumed all active departments."
+    assert extract_sql(raw_with_prose) == "SELECT count(*) FROM departments;"
+
+
+def test_execute_query_readonly_enforced():
+    """Verify read-only SQLite URI prevents any physical writes even if validation is skipped."""
+    with pytest.raises(sqlite3.OperationalError, match="readonly database"):
+        execute_query("db/company.db", "UPDATE employees SET salary = 0;")
+
+
+def test_execute_query_max_rows_cap():
+    """Verify query execution respects the max_rows ceiling."""
+    rows, _ = execute_query("db/company.db", "SELECT * FROM sales;", max_rows=5)
+    assert len(rows) <= 5

@@ -18,17 +18,27 @@ def get_db_schema(db_path: str) -> str:
     return "\n\n".join(f"-- Table: {name}\n{sql};" for name, sql in rows if sql)
 
 
-def execute_query(db_path: str, sql: str) -> tuple[list, list]:
+def execute_query(db_path: str, sql: str, timeout_seconds: float = 5.0, max_rows: int = 100) -> tuple[list, list]:
     """
     Execute a SQL query and return (rows, column_names).
     Opens DB in read-only mode to prevent any writes.
+    Enforces a query timeout and max row cap to prevent runaway queries.
     Raises sqlite3.Error on bad SQL.
     """
+    import time
+    start_time = time.time()
+
+    def timeout_handler():
+        if time.time() - start_time > timeout_seconds:
+            return 1  # non-zero aborts the query
+        return 0
+
     uri_path = f"file:{os.path.abspath(db_path).replace('\\', '/')}?mode=ro"
     with sqlite3.connect(uri_path, uri=True) as conn:
+        conn.set_progress_handler(timeout_handler, 1000)
         cur = conn.cursor()
         cur.execute(sql)
-        rows = cur.fetchall()
+        rows = cur.fetchmany(max_rows)
         cols = [desc[0] for desc in cur.description] if cur.description else []
     return rows, cols
 
@@ -58,7 +68,13 @@ def extract_sql(raw: str) -> str:
         raw,
         flags=re.IGNORECASE | re.DOTALL,
     )
-    return match.group(1).strip() if match else raw.strip()
+    if not match:
+        return raw.strip()
+    sql = match.group(1).strip()
+    # Cut at the first semicolon to drop trailing commentary or assumptions
+    if ";" in sql:
+        sql = sql.split(";")[0].strip() + ";"
+    return sql
 
 
 def validate_sql(sql: str) -> tuple[bool, str]:

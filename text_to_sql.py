@@ -107,21 +107,22 @@ class TextToSQL:
         self.answer_chain = ANSWER_PROMPT_TEMPLATE | self.llm | StrOutputParser()
 
     def _setup_agent(self):
-        """Build a LangChain SQL Agent (more powerful, handles errors itself)."""
-        db = SQLDatabase.from_uri(f"sqlite:///{self.db_path}")
+        """Build a LangChain SQL Agent with read-only database lockdown."""
+        abs_path = os.path.abspath(self.db_path).replace("\\", "/")
+        db = SQLDatabase.from_uri(f"sqlite:///file:{abs_path}?mode=ro&uri=true")
         toolkit = SQLDatabaseToolkit(db=db, llm=self.llm)
         self.agent = create_sql_agent(
             llm=self.llm,
             toolkit=toolkit,
-            agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+            agent_type="tool-calling",
             verbose=self.verbose,
-            handle_parsing_errors=True,
+            agent_executor_kwargs={"handle_parsing_errors": True},
         )
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def query(self, question: str) -> dict:
+    def query(self, question: str, generate_answer: bool = True) -> dict:
         """
         Main entry point.
 
@@ -158,55 +159,80 @@ class TextToSQL:
             if self.mode == "agent":
                 return self._query_agent(question, result)
             else:
-                return self._query_chain(question, result)
+                return self._query_chain(question, result, generate_answer=generate_answer)
         except Exception as e:
             result["error"] = str(e)
             result["answer"] = f"Sorry, I encountered an error: {e}"
             return result
 
-    def _query_chain(self, question: str, result: dict) -> dict:
-        # 1. Generate SQL via .invoke()
-        raw_sql = self.sql_chain.invoke({
-            "question": question,
-            "schema": self.schema,
-        })
-        sql = extract_sql(raw_sql)
+    def _query_chain(self, question: str, result: dict, max_retries: int = 1, generate_answer: bool = True) -> dict:
+        current_question = question
+        last_error = ""
 
-        # 2. Validate (read-only guard)
-        ok, reason = validate_sql(sql)
-        if not ok:
-            result["error"]  = reason
-            result["answer"] = reason
-            result["sql"]    = ""  # Clear generated SQL on validation failure!
-            return result
+        for attempt in range(max_retries + 1):
+            # 1. Generate SQL via .invoke()
+            raw_sql = self.sql_chain.invoke({
+                "question": current_question,
+                "schema": self.schema,
+            })
+            sql = extract_sql(raw_sql)
 
-        result["sql"] = sql
-    
-        # 3. Execute
-        rows, cols = execute_query(self.db_path, sql)
+            # 2. Validate (read-only guard)
+            ok, reason = validate_sql(sql)
+            if not ok:
+                result["error"]  = reason
+                result["answer"] = reason
+                result["sql"]    = ""  # Clear generated SQL on validation failure!
+                return result
+
+            result["sql"] = sql
+
+            # 3. Execute with automatic retry on SQL syntax/runtime errors
+            try:
+                rows, cols = execute_query(self.db_path, sql)
+                break
+            except Exception as e:
+                last_error = str(e)
+                if attempt < max_retries:
+                    current_question = (
+                        f"{question}\n"
+                        f"-- Note: Previous attempt produced `{sql}` which failed with: {last_error}. "
+                        f"Please fix the error and output valid SQLite."
+                    )
+                else:
+                    result["error"] = f"Execution error: {last_error}"
+                    result["answer"] = f"Failed to execute query: {last_error}"
+                    return result
+
         result["rows"]    = rows
         result["columns"] = cols
         result["table"]   = format_results(rows, cols)
 
         # 4. Natural language answer via .invoke()
-        sql_result_str = results_to_string(rows, cols)
-        answer = self.answer_chain.invoke({
-            "question": question,
-            "sql_query": sql,
-            "sql_result": sql_result_str,
-        })
-        result["answer"] = answer.strip()
+        if generate_answer:
+            sql_result_str = results_to_string(rows, cols)
+            answer = self.answer_chain.invoke({
+                "question": question,
+                "sql_query": sql,
+                "sql_result": sql_result_str,
+            })
+            result["answer"] = answer.strip()
+        else:
+            result["answer"] = ""
 
         # 5. Save to history
         self.history.append({"q": question, "sql": sql, "answer": result["answer"]})
         return result
 
     def _query_agent(self, question: str, result: dict) -> dict:
-        # AgentExecutor uses run() or invoke() depending on specific config, 
-        # using run() works seamlessly with standard string prompts here.
-        answer = self.agent.invoke(question)
-        result["answer"] = answer
-        self.history.append({"q": question, "answer": answer})
+        raw_output = self.agent.invoke({"input": question})
+        answer_text = (
+            raw_output.get("output", str(raw_output))
+            if isinstance(raw_output, dict)
+            else str(raw_output)
+        )
+        result["answer"] = answer_text
+        self.history.append({"q": question, "answer": answer_text})
         return result
 
     def get_history(self) -> list[dict]:
