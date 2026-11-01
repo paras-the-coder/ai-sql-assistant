@@ -1,23 +1,24 @@
 """
 evaluate.py  —  Comprehensive Benchmark Evaluation Suite for Text-to-SQL.
-Run:  python evaluate.py [--mode chain|agent] [--limit N] [--verbose]
+Run:  python evaluate.py [--no-retry] [--limit N] [--verbose]
 
-Evaluates execution accuracy (result-set comparison) against gold SQL benchmarks.
-Reports category-wise accuracy, latency metrics, and failure diagnostics.
+Measures chain-mode execution accuracy: the generated SQL's result set is compared with
+the result of a hand-written gold query. Reports per-category accuracy with a 95% Wilson
+interval, latency and failure types. Use --no-retry to measure the retry loop's effect.
+(Agent mode is not benchmarked: it returns prose, not a SQL result set.)
 """
 
 import sys
 import time
 import argparse
 from collections import Counter, defaultdict
-from itertools import permutations
 from tabulate import tabulate
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from text_to_sql import TextToSQL
-from utils import execute_query
+from utils import execute_query, compare_result_sets
 
 # ---------------------------------------------------------------------------
 # Benchmark Dataset (35 independent questions across 5 categories)
@@ -140,7 +141,7 @@ BENCHMARK_DATASET = [
         "category": "Join",
         "question": "Show employee names and products sold for sales transactions above 60000.",
         "gold_sql": """
-            SELECT e.name, s.product, s.amount 
+            SELECT e.name, s.product 
             FROM employees e 
             JOIN sales s ON e.emp_id = s.emp_id 
             WHERE s.amount > 60000;
@@ -170,7 +171,7 @@ BENCHMARK_DATASET = [
         "id": 18,
         "category": "Date Filter",
         "question": "How many sales transactions took place in the year 2024?",
-        "gold_sql": "SELECT COUNT(*) FROM sales WHERE sale_date >= '2024-01-01';",
+        "gold_sql": "SELECT COUNT(*) FROM sales WHERE sale_date BETWEEN '2024-01-01' AND '2024-12-31';",
     },
     {
         "id": 19,
@@ -181,8 +182,8 @@ BENCHMARK_DATASET = [
     {
         "id": 20,
         "category": "Date Filter",
-        "question": "Find active projects with deadlines strictly in the future.",
-        "gold_sql": "SELECT name, deadline FROM projects WHERE status = 'Active' AND deadline > DATE('now');",
+        "question": "Find active projects with a deadline after 2024-09-30.",
+        "gold_sql": "SELECT name, deadline FROM projects WHERE status = 'Active' AND deadline > '2024-09-30';",
     },
     {
         "id": 21,
@@ -307,8 +308,8 @@ BENCHMARK_DATASET = [
     {
         "id": 34,
         "category": "Multi-Condition",
-        "question": "How many Enterprise License sales were closed with amount above 50000?",
-        "gold_sql": "SELECT COUNT(*) FROM sales WHERE product = 'Enterprise License' AND amount > 50000;",
+        "question": "How many Enterprise License sales were closed with amount above 20000?",
+        "gold_sql": "SELECT COUNT(*) FROM sales WHERE product = 'Enterprise License' AND amount > 20000;",
     },
     {
         "id": 35,
@@ -324,165 +325,111 @@ BENCHMARK_DATASET = [
 ]
 
 
-def normalize_row_counter(rows: list[tuple]) -> Counter:
-    """Normalizes cell representations to allow fair multi-set equality check."""
-    normalized = []
-    for row in rows:
-        norm_cells = []
-        for val in row:
-            if isinstance(val, float):
-                norm_cells.append(str(round(val, 2)))
-            elif val is None:
-                norm_cells.append("")
-            else:
-                norm_cells.append(str(val).strip().lower())
-        normalized.append(tuple(norm_cells))
-    return Counter(normalized)
+def wilson_interval(passed: int, total: int, z: float = 1.96) -> tuple[float, float]:
+    """95% Wilson score interval for a pass rate (reliable at small n, unlike the normal approximation)."""
+    if total == 0:
+        return 0.0, 0.0
+    p = passed / total
+    denom = 1 + z**2 / total
+    centre = (p + z**2 / (2 * total)) / denom
+    half = z * (p * (1 - p) / total + z**2 / (4 * total**2)) ** 0.5 / denom
+    return centre - half, centre + half
 
 
-def compare_result_sets(gold_rows: list[tuple], gen_rows: list[tuple]) -> bool:
-    """
-    Compares two result sets.
-    Returns True if row multi-sets match directly, under column permutation,
-    or if the gold target columns are a perfect subset of the generated projection.
-    """
-    if not gold_rows and not gen_rows:
-        return True
-    if not gold_rows or not gen_rows:
-        return False
-    if len(gold_rows) != len(gen_rows):
-        return False
-
-    gold_counter = normalize_row_counter(gold_rows)
-    gen_counter = normalize_row_counter(gen_rows)
-
-    if gold_counter == gen_counter:
-        return True
-
-    num_gold_cols = len(gold_rows[0])
-    num_gen_cols = len(gen_rows[0])
-
-    if num_gen_cols >= num_gold_cols and num_gen_cols <= 6:
-        from itertools import combinations, permutations
-        for col_comb in combinations(range(num_gen_cols), num_gold_cols):
-            sub_gen = [tuple(row[i] for i in col_comb) for row in gen_rows]
-            if normalize_row_counter(sub_gen) == gold_counter:
-                return True
-            if num_gold_cols <= 4:
-                for p in permutations(range(num_gold_cols)):
-                    perm_sub = [tuple(r[i] for i in p) for r in sub_gen]
-                    if normalize_row_counter(perm_sub) == gold_counter:
-                        return True
-
-    return False
-
-
-def run_benchmark(mode: str = "chain", limit: int | None = None, verbose: bool = False):
+def run_benchmark(max_retries: int = 1, limit: int | None = None, verbose: bool = False):
     print("\n" + "=" * 70)
-    print(f"📊 Text-to-SQL Benchmark Evaluation Harness  |  Mode: {mode.upper()}")
+    print(f"📊 Text-to-SQL Benchmark  |  chain mode  |  retries: {max_retries}")
     print("=" * 70 + "\n")
 
     try:
-        bot = TextToSQL(mode=mode, verbose=verbose)
+        bot = TextToSQL(mode="chain", max_retries=max_retries, verbose=verbose)
     except Exception as e:
         print(f"❌ Failed to initialize TextToSQL: {e}")
         sys.exit(1)
 
-    dataset = BENCHMARK_DATASET[:limit] if limit else BENCHMARK_DATASET
+    # Run every gold query first; a benchmark item with an erroring or empty gold answer is invalid
+    # (an empty gold result would "pass" any query that also returns nothing), so it is excluded.
+    dataset = []
+    for item in BENCHMARK_DATASET[:limit]:
+        try:
+            gold_rows, _ = execute_query(bot.db_path, item["gold_sql"])
+        except Exception as e:
+            print(f"  [Q{item['id']:02d}] ⚠️ Skipped, gold SQL failed: {e}")
+            continue
+        if not gold_rows:
+            print(f"  [Q{item['id']:02d}] ⚠️ Skipped, gold SQL returns no rows")
+            continue
+        dataset.append((item, gold_rows))
+
     total_queries = len(dataset)
     passed_queries = 0
     total_latency = 0.0
-
+    retried = 0
     category_stats = defaultdict(lambda: {"total": 0, "passed": 0, "latency": 0.0})
     failures = []
 
-    for item in dataset:
-        qid = item["id"]
-        cat = item["category"]
-        question = item["question"]
-        gold_sql = item["gold_sql"]
-
+    for item, gold_rows in dataset:
+        qid, cat, question = item["id"], item["category"], item["question"]
         category_stats[cat]["total"] += 1
 
-        # 1. Execute Gold SQL
-        try:
-            gold_rows, _ = execute_query(bot.db_path, gold_sql)
-        except Exception as e:
-            print(f"  [Q{qid:02d}] ⚠️ Error executing gold SQL: {e}")
-            continue
-
-        # 2. Run generated pipeline
         t0 = time.time()
         result = bot.query(question, generate_answer=False)
         latency = time.time() - t0
-
         total_latency += latency
+        retried += bool(result.get("retries"))
         category_stats[cat]["latency"] += latency
 
-        # Check outcome
         if result["error"]:
-            is_correct = False
+            kind, is_correct = "pipeline error", False
             fail_reason = f"Pipeline Error: {result['error']}"
-        elif not result.get("rows") and gold_rows:
-            is_correct = False
+        elif not result.get("rows"):
+            kind, is_correct = "empty result", False
             fail_reason = "Empty result set returned"
         else:
             is_correct = compare_result_sets(gold_rows, result["rows"])
-            fail_reason = f"Mismatch: expected {len(gold_rows)} rows, got {len(result['rows'])}" if not is_correct else ""
+            kind = "wrong result"
+            fail_reason = f"Mismatch: expected {len(gold_rows)} rows, got {len(result['rows'])}"
 
-        status_str = "✅ PASS" if is_correct else "❌ FAIL"
-        print(f"  [{qid:02d}] [{cat:15s}] {status_str} ({latency:.2f}s) — {question[:55]}...", flush=True)
-        time.sleep(0.3)
+        print(f"  [{qid:02d}] [{cat:15s}] {'✅ PASS' if is_correct else '❌ FAIL'} ({latency:.2f}s) — {question[:55]}...", flush=True)
+        time.sleep(0.3)  # stay under API rate limits
 
         if is_correct:
             passed_queries += 1
             category_stats[cat]["passed"] += 1
         else:
             failures.append({
-                "id": qid,
-                "category": cat,
-                "question": question,
-                "gold_sql": gold_sql.strip(),
-                "gen_sql": result.get("sql", "").strip(),
+                "id": qid, "category": cat, "kind": kind, "question": question,
+                "gold_sql": item["gold_sql"].strip(), "gen_sql": result.get("sql", "").strip(),
                 "reason": fail_reason,
             })
 
-    # Summary
-    overall_pct = (passed_queries / total_queries) * 100 if total_queries else 0
-    avg_latency = total_latency / total_queries if total_queries else 0
+    if not total_queries:
+        print("No valid benchmark questions to run.")
+        return 0.0, 0.0
+
+    overall_pct = passed_queries / total_queries * 100
+    avg_latency = total_latency / total_queries
+    low, high = wilson_interval(passed_queries, total_queries)
 
     print("\n" + "-" * 70)
-    print("📈 Category Performance Breakdown:")
-    print("-" * 70)
-
-    summary_rows = []
-    for cat, data in sorted(category_stats.items()):
-        pct = (data["passed"] / data["total"]) * 100 if data["total"] else 0
-        avg_cat_lat = data["latency"] / data["total"] if data["total"] else 0
-        summary_rows.append([
-            cat,
-            data["passed"],
-            data["total"],
-            f"{pct:.1f}%",
-            f"{avg_cat_lat:.2f}s"
-        ])
-
-    summary_table = tabulate(
-        summary_rows,
-        headers=["Category", "Passed", "Total", "Accuracy", "Avg Latency"],
-        tablefmt="rounded_outline"
-    )
-    print(summary_table)
+    summary_rows = [
+        [cat, d["passed"], d["total"], f"{d['passed'] / d['total'] * 100:.1f}%", f"{d['latency'] / d['total']:.2f}s"]
+        for cat, d in sorted(category_stats.items())
+    ]
+    print(tabulate(summary_rows, headers=["Category", "Passed", "Total", "Accuracy", "Avg Latency"], tablefmt="rounded_outline"))
 
     print("\n" + "=" * 70)
-    print(f"🏆 Overall Execution Accuracy: {passed_queries}/{total_queries} ({overall_pct:.1f}%)")
-    print(f"⚡ Average Query Latency:     {avg_latency:.2f}s per query")
+    print(f"🏆 Execution accuracy: {passed_queries}/{total_queries} ({overall_pct:.1f}%)  |  95% CI: {low * 100:.0f}%–{high * 100:.0f}%")
+    print(f"⚡ Avg latency (SQL generation + execution, incl. retries): {avg_latency:.2f}s")
+    print(f"🔁 Retry loop fired on {retried}/{total_queries} questions")
+    if failures:
+        print("❌ Failures by type: " + ", ".join(f"{k}: {v}" for k, v in Counter(f["kind"] for f in failures).items()))
     print("=" * 70 + "\n")
 
     if failures and verbose:
-        print("❌ Failure Diagnostics:")
+        print("Failure diagnostics:")
         for f in failures:
-            print(f"\n[Q{f['id']:02d} - {f['category']}] {f['question']}")
+            print(f"\n[Q{f['id']:02d} - {f['category']} - {f['kind']}] {f['question']}")
             print(f"  Reason:   {f['reason']}")
             print(f"  Gold SQL: {f['gold_sql']}")
             print(f"  Gen  SQL: {f['gen_sql']}")
@@ -492,10 +439,10 @@ def run_benchmark(mode: str = "chain", limit: int | None = None, verbose: bool =
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run Text-to-SQL benchmark evaluation.")
-    parser.add_argument("--mode", choices=["chain", "agent"], default="chain", help="Inference engine mode")
-    parser.add_argument("--limit", type=int, default=None, help="Limit number of queries to test")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Print detailed SQL on failure")
+    parser = argparse.ArgumentParser(description="Run the Text-to-SQL benchmark (chain mode).")
+    parser.add_argument("--no-retry", action="store_true", help="Disable the SQL-error retry loop (for ablation)")
+    parser.add_argument("--limit", type=int, default=None, help="Only run the first N questions")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Print gold vs generated SQL for failures")
     args = parser.parse_args()
 
-    run_benchmark(mode=args.mode, limit=args.limit, verbose=args.verbose)
+    run_benchmark(max_retries=0 if args.no_retry else 1, limit=args.limit, verbose=args.verbose)

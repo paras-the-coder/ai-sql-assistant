@@ -5,8 +5,10 @@ utils.py  —  Helper utilities for the Text-to-SQL project.
 import sqlite3
 import os
 import re
+import time
+from collections import Counter
+from itertools import combinations, permutations
 from tabulate import tabulate
-from typing import Optional
 
 
 def get_db_schema(db_path: str) -> str:
@@ -25,7 +27,6 @@ def execute_query(db_path: str, sql: str, timeout_seconds: float = 5.0, max_rows
     Enforces a query timeout and max row cap to prevent runaway queries.
     Raises sqlite3.Error on bad SQL.
     """
-    import time
     start_time = time.time()
 
     def timeout_handler():
@@ -71,9 +72,10 @@ def extract_sql(raw: str) -> str:
     if not match:
         return raw.strip()
     sql = match.group(1).strip()
-    # Cut at the first semicolon to drop trailing commentary or assumptions
-    if ";" in sql:
-        sql = sql.split(";")[0].strip() + ";"
+    # Keep only the first complete statement (complete_statement ignores ';' inside string literals)
+    for i, ch in enumerate(sql):
+        if ch == ";" and sqlite3.complete_statement(sql[: i + 1]):
+            return sql[: i + 1]
     return sql
 
 
@@ -84,11 +86,56 @@ def validate_sql(sql: str) -> tuple[bool, str]:
         return False, "Blocked: Only SELECT / READ queries are permitted."
 
     forbidden = r"\b(UPDATE|DELETE|DROP|INSERT|ALTER|CREATE|TRUNCATE|ATTACH|DETACH)\b"
-    match = re.search(forbidden, clean_sql, re.IGNORECASE)
+    # Ignore text inside '...' literals so values like 'Delete Specialist' aren't flagged
+    unquoted_sql = re.sub(r"'(?:[^']|'')*'", "''", clean_sql)
+    match = re.search(forbidden, unquoted_sql, re.IGNORECASE)
     if match:
         return False, f"Blocked: Operation '{match.group(0).upper()}' is strictly prohibited."
 
     return True, ""
+
+
+def normalize_row_counter(rows: list[tuple]) -> Counter:
+    """Order-insensitive multiset of rows with normalised cell text, for fair comparison."""
+    normalized = []
+    for row in rows:
+        cells = []
+        for val in row:
+            if isinstance(val, float):
+                cells.append(str(round(val, 2)))
+            elif val is None:
+                cells.append("")
+            else:
+                cells.append(str(val).strip().lower())
+        normalized.append(tuple(cells))
+    return Counter(normalized)
+
+
+def compare_result_sets(gold_rows: list[tuple], gen_rows: list[tuple]) -> bool:
+    """
+    Execution-accuracy check. True if the generated rows equal the gold rows as a
+    multiset, or if the gold columns appear (in any order) among the generated
+    columns. A single *numeric* gold answer (e.g. a COUNT) must match exactly, so an
+    unrelated row that merely contains the same number can never pass.
+    """
+    if not gold_rows or len(gold_rows) != len(gen_rows):
+        return False
+
+    gold = normalize_row_counter(gold_rows)
+    if gold == normalize_row_counter(gen_rows):
+        return True
+
+    n_gold, n_gen = len(gold_rows[0]), len(gen_rows[0])
+    scalar_number = len(gold_rows) == 1 and n_gold == 1 and isinstance(gold_rows[0][0], (int, float))
+    if scalar_number or n_gen < n_gold or n_gen > 12:  # 12 bounds the column-combination search
+        return False
+
+    for cols in combinations(range(n_gen), n_gold):
+        for perm in permutations(cols):
+            candidate = [tuple(row[i] for i in perm) for row in gen_rows]
+            if normalize_row_counter(candidate) == gold:
+                return True
+    return False
 
 
 def results_to_string(rows: list, cols: list, max_rows: int = 10) -> str:

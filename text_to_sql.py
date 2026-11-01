@@ -10,7 +10,6 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import create_sql_agent
 from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
-from langchain.agents import AgentType
 
 from prompts import FEW_SHOT_EXAMPLES, ANSWER_PROMPT_TEMPLATE, SQL_SYSTEM_PROMPT
 from utils import (
@@ -41,11 +40,13 @@ class TextToSQL:
         mode: str = "chain",  # 'chain' | 'agent'
         model: str | None = None,
         verbose: bool = False,
+        max_retries: int = 1,  # chain mode: SQL-error retries (0 disables)
     ):
         load_dotenv()
 
         self.db_path = db_path or os.getenv("DB_PATH", "db/company.db")
         self.mode    = mode
+        self.max_retries = max_retries
         self.verbose = verbose or (os.getenv("DEBUG", "false").lower() == "true")
 
         if not check_db_exists(self.db_path):
@@ -60,7 +61,7 @@ class TextToSQL:
                 "GROQ_API_KEY not set.\nCopy .env.example to .env and add your key."
             )
 
-        model_name = model or os.getenv("GROQ_MODEL", "llama3-70b-8192")
+        model_name = model or os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
         # --- LLM ----------------------------------------------------------
         self.llm = ChatGroq(
@@ -165,11 +166,11 @@ class TextToSQL:
             result["answer"] = f"Sorry, I encountered an error: {e}"
             return result
 
-    def _query_chain(self, question: str, result: dict, max_retries: int = 1, generate_answer: bool = True) -> dict:
+    def _query_chain(self, question: str, result: dict, generate_answer: bool = True) -> dict:
         current_question = question
         last_error = ""
 
-        for attempt in range(max_retries + 1):
+        for attempt in range(self.max_retries + 1):
             # 1. Generate SQL via .invoke()
             raw_sql = self.sql_chain.invoke({
                 "question": current_question,
@@ -190,10 +191,11 @@ class TextToSQL:
             # 3. Execute with automatic retry on SQL syntax/runtime errors
             try:
                 rows, cols = execute_query(self.db_path, sql)
+                result["retries"] = attempt  # how many retries this answer needed
                 break
             except Exception as e:
                 last_error = str(e)
-                if attempt < max_retries:
+                if attempt < self.max_retries:
                     current_question = (
                         f"{question}\n"
                         f"-- Note: Previous attempt produced `{sql}` which failed with: {last_error}. "
